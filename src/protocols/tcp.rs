@@ -1,3 +1,5 @@
+use std::io;
+
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -7,7 +9,7 @@ use tokio::{
     },
 };
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 use crate::protocols::{ProxyTarget, WebSocketReceiver, WebSocketSender};
 
@@ -15,6 +17,7 @@ pub struct TcpConnection {
     ip_address: String,
     port: u16,
     stream: Option<TcpStream>,
+    cancel_token: tokio_util::sync::CancellationToken,
 }
 
 impl TcpConnection {
@@ -23,58 +26,105 @@ impl TcpConnection {
             ip_address: ip_address,
             port: port,
             stream: None,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
         }
     }
 
-    async fn proxy_tcp_to_web(mut tcp_reader: OwnedReadHalf, mut ws_sender: WebSocketSender) {
+    async fn proxy_tcp_to_web(
+        mut tcp_reader: OwnedReadHalf,
+        mut ws_sender: WebSocketSender,
+        token: tokio_util::sync::CancellationToken,
+    ) {
+        info!("TCP->Web started!");
         let mut buffer = [0; 1024];
         loop {
-            match tcp_reader.read(&mut buffer).await {
-                Ok(0) => {
-                    debug!("Received EOF");
-                    let _ = ws_sender.close();
+            tokio::select! {
+                _ = token.cancelled() => {
                     break;
                 }
-
-                Ok(rx_n) => {
-                    if let Err(tx_err) = ws_sender
-                        .send(Message::Binary(buffer[..rx_n].to_vec()))
-                        .await
-                    {
-                        error!("Encountered an error while transmitting to web: {}", tx_err);
-                        break;
+                rx = tcp_reader.read(&mut buffer) => {
+                    match rx {
+                        Ok(0) => {
+                            info!("Received EOF");
+                            break;
+                        }
+                        Ok(rx_n) => {
+                            if let Err(tx_err) = ws_sender
+                            .send(Message::Binary(buffer[..rx_n].to_vec()))
+                            .await
+                            {
+                                error!("Encountered an error while transmitting to web: {}", tx_err);
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            if err.kind() != io::ErrorKind::WouldBlock {
+                                error!("Failed to read from socket");
+                                token.cancel();
+                                break;
+                            }
+                        }
                     }
-                }
-                Err(_) => {
-                    error!("Failed to read from socket");
-                    let _ = ws_sender.close();
-                    break;
                 }
             }
         }
+
+        let _ = ws_sender.close();
         info!("Ended tcp->web");
     }
 
-    async fn proxy_web_to_tcp(mut ws_receiver: WebSocketReceiver, mut tcp_writer: OwnedWriteHalf) {
-        while let Some(msg) = ws_receiver.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    let _ = tcp_writer.write(text.as_bytes()).await;
+    async fn proxy_web_to_tcp(
+        mut ws_receiver: WebSocketReceiver,
+        mut tcp_writer: OwnedWriteHalf,
+        token: &tokio_util::sync::CancellationToken,
+    ) {
+        info!("Web->TCP started!");
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    let _ = tcp_writer.shutdown().await;
+                    info!("Web->TCP token was cancelled, shutting down");
+                    break;
                 }
-                Ok(Message::Binary(bin)) => {
-                    let _ = tcp_writer.write(&bin).await;
+                msg = ws_receiver.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            let _ = tcp_writer.write(text.as_bytes()).await;
+                        }
+                        Some(Ok(Message::Binary(bin))) => {
+                            let _ = tcp_writer.write(&bin).await;
+                        }
+                        Some(Ok(Message::Pong(pong))) => {
+                            let _ = tcp_writer.write(&pong).await;
+                        }
+                        Some(Ok(Message::Ping(ping))) => {
+                            let _ = tcp_writer.write(&ping).await;
+                        }
+                        Some(Ok(Message::Frame(frame))) => {
+                            let _ = tcp_writer.write(&frame.into_data()).await;
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            info!("Websocket was closed by client!");
+                            let _ = tcp_writer.shutdown().await;
+                            token.cancel();
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            error!("Web->TCP Error: {}", e);
+                            token.cancel();
+                            break;
+                        }
+                        None => {
+                            info!("WebSocket stream ended");
+                            let _ = tcp_writer.shutdown().await;
+                            token.cancel();
+                            break;
+                        }
+                    }
                 }
-                Ok(Message::Pong(_)) | Ok(Message::Ping(_)) | Ok(Message::Frame(_)) => {}
-                Ok(Message::Close(_)) => {
-                    info!("Websocket was closed by client!");
-                    let _ = tcp_writer.shutdown();
-                }
-                Err(e) => {
-                    error!("WebSocket Error: {}", e);
-                }
-            };
+            }
         }
-        debug!("Ended web->tcp");
+        info!("Ended web->tcp");
     }
 }
 
@@ -93,9 +143,16 @@ impl ProxyTarget for TcpConnection {
             .take()
             .expect("stream not connected")
             .into_split();
-        debug!("Attaching handles!");
+        info!("Attaching handles!");
 
-        tokio::spawn(TcpConnection::proxy_tcp_to_web(tcp_reader, ws_sender));
-        let _ = TcpConnection::proxy_web_to_tcp(ws_receiver, tcp_writer).await;
+        let cloned_token = self.cancel_token.clone();
+
+        tokio::spawn(TcpConnection::proxy_tcp_to_web(
+            tcp_reader,
+            ws_sender,
+            cloned_token,
+        ));
+        let _ = TcpConnection::proxy_web_to_tcp(ws_receiver, tcp_writer, &self.cancel_token).await;
+        info!("Done awating proxy_we_to_tcp");
     }
 }

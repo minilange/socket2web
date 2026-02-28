@@ -1,5 +1,5 @@
 pub mod tcp;
-use futures_util::{SinkExt, stream::{SplitSink, SplitStream}};
+use futures_util::{stream::{SplitSink, SplitStream}};
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 use crate::protocols::tcp::TcpConnection;
@@ -18,20 +18,4 @@ pub trait ProxyTarget: Send {
         ws_sender: WebSocketSender, 
         ws_receiver: WebSocketReceiver
     );
-
-    async fn proxy_success(&self, ws_sender: &mut WebSocketSender) {
-        let json_str = serde_json::json!({
-            "status": "Successfully connected, strarting to proxy",
-        });
-        let _ = ws_sender.send(Message::text(json_str.to_string())).await;
-    }
-
-    async fn proxy_failed(&self, reason: &str, ws_sender: &mut WebSocketSender) {
-        let json_str = serde_json::json!({
-            "status": "Connection failed, cancelling proxy",
-            "reason": reason
-        });
-        let _ = ws_sender.send(Message::Text(json_str.to_string())).await;
-    }
-
 }

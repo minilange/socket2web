@@ -1,11 +1,9 @@
-use futures_util::{
-    SinkExt, StreamExt,
-    stream::{SplitSink, SplitStream},
-};
+use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+use crate::arguments;
 use crate::protocols::tcp::TcpConnection;
 use crate::protocols::{Protocol, ProxyTarget, WebSocketReceiver, WebSocketSender};
 
@@ -14,10 +12,10 @@ pub struct WebSocket {
 }
 
 impl WebSocket {
-    // Initialize a new WebSocket
-    // all WebSocket config should be handled here
-    pub fn new(address: String) -> Self {
-        Self { address }
+    pub fn new(config: &arguments::WebSocketArguments) -> Self {
+        Self {
+            address: format!("{}:{}", config.ip, config.port),
+        }
     }
 
     pub async fn start_listening(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -27,14 +25,14 @@ impl WebSocket {
         tracing::info!("Now listening to address: {}", &self.address);
 
         while let Ok((stream, addr)) = listener.accept().await {
-            tokio::spawn(WebSocket::handle_connection(stream, addr));
+            let _ = tokio::spawn(WebSocket::handle_connection(stream, addr));
         }
 
         return Ok(());
     }
 
     async fn handle_connection(stream: TcpStream, addr: SocketAddr) {
-        tracing::debug!("Got new connection {}", addr.ip().to_string());
+        tracing::info!("Got new connection {}", addr.ip().to_string());
 
         let ws_stream = match accept_async(stream).await {
             Ok(ws) => ws,
@@ -47,11 +45,10 @@ impl WebSocket {
 
         match WebSocket::handle_handshake(&mut ws_sender, &mut ws_receiver).await {
             Ok(Protocol::Tcp(mut proxy)) => {
-                // let mut proxy = WebSocket::create_proxy(handshake);
                 if let Err(e) = proxy.connect().await {
-                    proxy.proxy_failed(&e.to_string(), &mut ws_sender).await;
+                    WebSocket::proxy_failed(&e.to_string(), &mut ws_sender).await;
                 } else {
-                    proxy.proxy_success(&mut ws_sender).await;
+                    WebSocket::proxy_success(&mut ws_sender).await;
                     proxy.attach_handles(ws_sender, ws_receiver).await;
                 }
             }
@@ -117,5 +114,20 @@ impl WebSocket {
             Err(e) => Err(e.into()),
             _ => Err("Unsupported protocol".into()),
         }
+    }
+
+    async fn proxy_success(ws_sender: &mut WebSocketSender) {
+        let json_str = serde_json::json!({
+            "status": "Successfully connected, strarting to proxy",
+        });
+        let _ = ws_sender.send(Message::text(json_str.to_string())).await;
+    }
+
+    async fn proxy_failed(reason: &str, ws_sender: &mut WebSocketSender) {
+        let json_str = serde_json::json!({
+            "status": "Connection failed, cancelling proxy",
+            "reason": reason
+        });
+        let _ = ws_sender.send(Message::Text(json_str.to_string())).await;
     }
 }
