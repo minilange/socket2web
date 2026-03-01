@@ -1,6 +1,6 @@
-use std::io;
-
+use crate::protocols::{ProtocolSchema, ProxyTarget, Schema, WebSocketReceiver, WebSocketSender};
 use futures_util::{SinkExt, StreamExt};
+use std::io;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -9,43 +9,53 @@ use tokio::{
     },
 };
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{error, info};
+use tokio_util::sync::CancellationToken;
 
-use crate::protocols::{ProxyTarget, WebSocketReceiver, WebSocketSender};
-
+/// Represents a proxied TCP connection to a target server.
+///
+/// Manages the lifecycle of a TCP connection including establishing
+/// the connection and bidirectional data proxying between a WebSocket
+/// client and the TCP target.
 pub struct TcpConnection {
     ip_address: String,
     port: u16,
     stream: Option<TcpStream>,
-    cancel_token: tokio_util::sync::CancellationToken,
 }
 
 impl TcpConnection {
+    /// Creates a new `TcpConnection` targeting the given IP address and port.
+    ///
+    /// The connection is not established until [`connect`](TcpConnection::connect) is called.
     pub fn new(ip_address: String, port: u16) -> Self {
         Self {
             ip_address: ip_address,
             port: port,
             stream: None,
-            cancel_token: tokio_util::sync::CancellationToken::new(),
         }
     }
 
+    /// Reads data from the TCP stream and forwards it to the WebSocket sender.
+    ///
+    /// Runs in a loop until the TCP stream sends EOF, an error occurs,
+    /// or the cancellation token is triggered. Ensures the token is cancelled
+    /// and the WebSocket sender is closed upon exit.
     async fn proxy_tcp_to_web(
         mut tcp_reader: OwnedReadHalf,
         mut ws_sender: WebSocketSender,
         token: tokio_util::sync::CancellationToken,
     ) {
-        info!("TCP->Web started!");
-        let mut buffer = [0; 1024];
+        let mut buffer = vec![0u8; 65536];
         loop {
             tokio::select! {
+                biased;
                 _ = token.cancelled() => {
                     break;
                 }
                 rx = tcp_reader.read(&mut buffer) => {
                     match rx {
                         Ok(0) => {
-                            info!("Received EOF");
+                            tracing::debug!("TCP stream reached end of stream");
+                            token.cancel();
                             break;
                         }
                         Ok(rx_n) => {
@@ -53,13 +63,13 @@ impl TcpConnection {
                             .send(Message::Binary(buffer[..rx_n].to_vec()))
                             .await
                             {
-                                error!("Encountered an error while transmitting to web: {}", tx_err);
+                                tracing::error!("Encountered an error while transmitting to web: {}", tx_err);
                                 break;
                             }
                         }
                         Err(err) => {
                             if err.kind() != io::ErrorKind::WouldBlock {
-                                error!("Failed to read from socket");
+                                tracing::error!("Failed to read from TCP socket: {}", err);
                                 token.cancel();
                                 break;
                             }
@@ -68,55 +78,67 @@ impl TcpConnection {
                 }
             }
         }
-
-        let _ = ws_sender.close();
-        info!("Ended tcp->web");
+        // Ensure token is cancelled if out of loop
+        if !token.is_cancelled() {
+            token.cancel();
+        }
+        let _ = ws_sender.close().await;
+        tracing::trace!("TCP->Web proxy ended");
     }
 
+    /// Reads messages from the WebSocket receiver and forwards them to the TCP writer.
+    ///
+    /// Handles `Text`, `Binary`, and `Frame` messages by writing their data to TCP.
+    /// `Ping` and `Pong` messages are ignored (handled at the WebSocket layer).
+    /// Runs until the WebSocket stream closes, an error occurs, or the
+    /// cancellation token is triggered. Ensures the token is cancelled and
+    /// the TCP writer is shut down upon exit.
     async fn proxy_web_to_tcp(
         mut ws_receiver: WebSocketReceiver,
         mut tcp_writer: OwnedWriteHalf,
-        token: &tokio_util::sync::CancellationToken,
+        token: tokio_util::sync::CancellationToken,
     ) {
-        info!("Web->TCP started!");
         loop {
             tokio::select! {
+                biased;
                 _ = token.cancelled() => {
-                    let _ = tcp_writer.shutdown().await;
-                    info!("Web->TCP token was cancelled, shutting down");
+                    tracing::debug!("Web->TCP cancelled, shutting down");
                     break;
                 }
                 msg = ws_receiver.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            let _ = tcp_writer.write(text.as_bytes()).await;
+                            if let Err(err) = tcp_writer.write_all(text.as_bytes()).await {
+                                tracing::error!("Encountered an error while sending 'Text' to tcp: {}", err);
+                                break;
+                            }
                         }
                         Some(Ok(Message::Binary(bin))) => {
-                            let _ = tcp_writer.write(&bin).await;
+                            if let Err(err) = tcp_writer.write_all(&bin).await {
+                                tracing::error!("Encountered an error while sending 'Binary' to tcp: {}", err);
+                                break;
+                            }
                         }
-                        Some(Ok(Message::Pong(pong))) => {
-                            let _ = tcp_writer.write(&pong).await;
-                        }
-                        Some(Ok(Message::Ping(ping))) => {
-                            let _ = tcp_writer.write(&ping).await;
-                        }
+                        Some(Ok(Message::Pong(_))) |
+                        Some(Ok(Message::Ping(_))) => { }
                         Some(Ok(Message::Frame(frame))) => {
-                            let _ = tcp_writer.write(&frame.into_data()).await;
+                            if let Err(err) = tcp_writer.write_all(&frame.into_data()).await {
+                                tracing::error!("Encountered an error while sending 'Frame' to tcp: {}", err);
+                                break;
+                            }
                         }
                         Some(Ok(Message::Close(_))) => {
-                            info!("Websocket was closed by client!");
-                            let _ = tcp_writer.shutdown().await;
+                            tracing::debug!("WebSocket closed by client");
                             token.cancel();
                             break;
                         }
                         Some(Err(e)) => {
-                            error!("Web->TCP Error: {}", e);
+                            tracing::error!("Web->TCP Error: {}", e);
                             token.cancel();
                             break;
                         }
                         None => {
-                            info!("WebSocket stream ended");
-                            let _ = tcp_writer.shutdown().await;
+                            tracing::debug!("WebSocket stream ended");
                             token.cancel();
                             break;
                         }
@@ -124,11 +146,19 @@ impl TcpConnection {
                 }
             }
         }
-        info!("Ended web->tcp");
+        // Ensure token is cancelled if out of loop
+        if !token.is_cancelled() {
+            token.cancel();
+        }
+        let _ = tcp_writer.shutdown().await;
+        tracing::trace!("Web->TCP proxy ended");
     }
 }
 
 impl ProxyTarget for TcpConnection {
+    /// Establishes a TCP connection to the configured target address and port.
+    ///
+    /// Returns an error if the connection cannot be established.
     async fn connect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let stream = TcpStream::connect(format!("{}:{}", &self.ip_address, &self.port))
             .await
@@ -137,22 +167,50 @@ impl ProxyTarget for TcpConnection {
         return Ok(());
     }
 
-    async fn attach_handles(&mut self, ws_sender: WebSocketSender, ws_receiver: WebSocketReceiver) {
-        let (tcp_reader, tcp_writer) = self
-            .stream
-            .take()
-            .expect("stream not connected")
-            .into_split();
-        info!("Attaching handles!");
+    /// Splits the TCP stream and starts bidirectional proxying.
+    ///
+    /// Spawns [`proxy_tcp_to_web`](TcpConnection::proxy_tcp_to_web) on a separate task
+    /// and runs [`proxy_web_to_tcp`](TcpConnection::proxy_web_to_tcp) on the current task.
+    /// Waits for both directions to complete before returning.
+    ///
+    /// # Panics
+    ///
+    /// Logs an error and returns early if called before [`connect`](TcpConnection::connect).
+    async fn attach_handles(&mut self, ws_sender: WebSocketSender, ws_receiver: WebSocketReceiver, cancel_token: CancellationToken) {
+        let (tcp_reader, tcp_writer) = match self.stream.take() {
+            Some(stream) => stream.into_split(),
+            None => {
+                tracing::error!("Tried to attach handle with no connected stream");
+                return;
+            }
+        };
+        tracing::debug!("Attaching proxy handles");
 
-        let cloned_token = self.cancel_token.clone();
+        let server_token = cancel_token.clone();
+        let target_token = cancel_token.clone();
 
-        tokio::spawn(TcpConnection::proxy_tcp_to_web(
+        let tcp_to_web = tokio::spawn(TcpConnection::proxy_tcp_to_web(
             tcp_reader,
             ws_sender,
-            cloned_token,
+            server_token,
         ));
-        let _ = TcpConnection::proxy_web_to_tcp(ws_receiver, tcp_writer, &self.cancel_token).await;
-        info!("Done awating proxy_we_to_tcp");
+        let _ = TcpConnection::proxy_web_to_tcp(ws_receiver, tcp_writer, target_token).await;
+        let _ = tcp_to_web.await;
+    }
+}
+
+impl ProtocolSchema for TcpConnection {
+    /// Returns the handshake schema for the TCP protocol.
+    ///
+    /// Requires `target_ip` (the destination IP address) and
+    /// `target_port` (the destination port number) from the client.
+    fn schema() -> Schema {
+        Schema {
+            name: "tcp".into(),
+            requirements: serde_json::json! ({
+                "target_ip": "IP Address",
+                "target_port": "Port for IP Address"
+            }),
+        }
     }
 }

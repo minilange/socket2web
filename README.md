@@ -57,4 +57,4 @@ After the handshake, all subsequent data is proxied transparently.
 
 ## Conclusion
 
-"Socket to Web" aims to provide a simple, robust, and extensible solution for bridging the gap between traditional socket-based systems and modern web applications. Contributions and feedback are welcome!
+"Socket2Web" aims to provide a simple, robust, and extensible solution for bridging the gap between traditional socket-based systems and modern web applications. Contributions and feedback are welcome!
