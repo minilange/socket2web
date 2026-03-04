@@ -286,3 +286,11 @@ impl WebSocket {
         let _ = ws_sender.send(Message::Text(json_str.to_string())).await;
     }
 }
+
+
+mod tests {
+    use super::*;
+
+    
+
+}
