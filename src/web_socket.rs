@@ -204,7 +204,7 @@ impl WebSocket {
     /// format, including the protocol, target IP, and target port fields.
     fn get_greeting() -> Message {
         let greeting = serde_json::json!({
-            "supported protocols": {
+            "supported_protocols": {
                 TcpConnection::schema().name: TcpConnection::schema().requirements
             }
         });
@@ -287,10 +287,183 @@ impl WebSocket {
     }
 }
 
-
 mod tests {
     use super::*;
 
-    
+    #[tokio::test]
+    async fn web_socket_proxy_success() {
+        let ws_server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_port = ws_server.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move {
+            let (mut client_ws, _) =
+                tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", ws_port.port()))
+                    .await
+                    .unwrap();
+            match client_ws.next().await.unwrap() {
+                Ok(Message::Text(text)) => {
+                    return text;
+                }
+                other => {
+                    panic!("Expected Text message, got {:?}", other);
+                }
+            }
+        });
+
+        let (stream, _) = ws_server.accept().await.unwrap();
+        let ws = accept_async(stream).await.unwrap();
+        let (mut sender, _) = ws.split();
+
+        WebSocket::proxy_success(&mut sender).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), client_handle).await;
+        assert!(result.is_ok(), "Socket should have received something");
+
+        let res_string = result.unwrap().unwrap();
+
+        assert_ne!(res_string, "Failed");
+
+        let val: serde_json::Value = serde_json::from_str(&res_string).unwrap();
+        assert!(
+            val.get("status")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .starts_with("Successfully connected, starting to proxy")
+        );
+    }
+
+    #[tokio::test]
+    async fn web_socket_proxy_failed() {
+        let ws_server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_port = ws_server.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move {
+            let (mut client_ws, _) =
+                tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", ws_port.port()))
+                    .await
+                    .unwrap();
+            match client_ws.next().await.unwrap() {
+                Ok(Message::Text(text)) => {
+                    return text;
+                }
+                other => {
+                    panic!("Expected Text message, got {:?}", other);
+                }
+            }
+        });
+
+        let (stream, _) = ws_server.accept().await.unwrap();
+        let ws = accept_async(stream).await.unwrap();
+        let (mut sender, _) = ws.split();
+
+        WebSocket::proxy_failed("This is an error message", &mut sender).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), client_handle).await;
+        assert!(result.is_ok(), "Socket should have received something");
+
+        let res_string = result.unwrap().unwrap();
+
+        assert_ne!(res_string, "Failed");
+
+        let val: serde_json::Value = serde_json::from_str(&res_string).unwrap();
+        assert!(
+            val.get("status")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .starts_with("Connection failed, cancelling proxy")
+        );
+        assert!(
+            val.get("reason")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .starts_with("This is an error message")
+        );
+    }
+
+    #[tokio::test]
+    async fn web_socket_read_greeting_valid_json_but_missing_fields() {
+        let json_greeting = serde_json::json!({
+            "not protocol": "whatever",
+        });
+        let res = WebSocket::read_greeting(&json_greeting.to_string());
+        assert!(res.is_err(), "Should have returned an error");
+        let err = res.unwrap_err();
+        assert_eq!(err.to_string(), "Missing or invalid protocol field");
+    }
+
+    #[tokio::test]
+    async fn web_socket_read_greeting_invalid_tcp_protocol() {
+        let json_greeting = serde_json::json!({
+            "protocol": "tcp",
+        });
+        let res = WebSocket::read_greeting(&json_greeting.to_string());
+        assert!(res.is_err(), "Should have returned an error");
+        let err = res.unwrap_err();
+        assert_eq!(err.to_string(), "Missing or invalid target_ip");
+    }
+
+    #[tokio::test]
+    async fn web_socket_read_greeting_invalid_tcp_protocol_with_ip() {
+        let json_greeting = serde_json::json!({
+            "protocol": "tcp",
+            "target_ip": "some_ip"
+        });
+        let res = WebSocket::read_greeting(&json_greeting.to_string());
+        assert!(res.is_err(), "Should have returned an error");
+        let err = res.unwrap_err();
+        assert_eq!(err.to_string(), "Missing or invalid target_port");
+    }
+
+    #[tokio::test]
+    async fn web_socket_read_greeting_invalid_tcp_protocol_with_invalid_port() {
+        let json_greeting = serde_json::json!({
+            "protocol": "tcp",
+            "target_ip": "some_ip",
+            "target_port": "not a num"
+        });
+        let res = WebSocket::read_greeting(&json_greeting.to_string());
+        assert!(res.is_err(), "Should have returned an error");
+        let err = res.unwrap_err();
+        assert_eq!(err.to_string(), "Missing or invalid target_port");
+    }
+
+    #[tokio::test]
+    async fn web_socket_read_greeting_valid_tcp_protocol() {
+        let json_greeting = serde_json::json!({
+            "protocol": "tcp",
+            "target_ip": "some_ip",
+            "target_port": 123
+        });
+        let res = WebSocket::read_greeting(&json_greeting.to_string());
+        assert!(res.is_ok(), "Should have returned ok");
+        assert!(matches!(res.unwrap(), Protocol::Tcp(_)));
+    }
+
+    #[tokio::test]
+    async fn web_socket_read_greeting_invalid_json() {
+        let json_greeting = "this is not json";
+        let res = WebSocket::read_greeting(json_greeting);
+        assert!(res.is_err(), "Should have returned an error");
+    }
+
+    #[tokio::test]
+    async fn web_socket_get_greeting_contains_tcp() {
+
+        let greeting_str = match WebSocket::get_greeting() {
+            Message::Text(msg) => {
+                msg
+            },
+            _ => panic!("Should have received a Message::Text()")
+        };
+
+        let greeting_obj: serde_json::Value = serde_json::from_str(&greeting_str).unwrap();
+
+        let supported_protocol = greeting_obj.get("supported_protocols").unwrap();
+        assert!(supported_protocol.get("tcp").is_some());
+    }
+
 
 }

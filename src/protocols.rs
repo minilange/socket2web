@@ -6,6 +6,7 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 use crate::protocols::tcp::TcpConnection;
 
 /// Enumerates the supported proxy target protocols.
+#[derive(Debug)]
 pub enum Protocol {
     /// A raw TCP socket connection.
     Tcp(TcpConnection),
