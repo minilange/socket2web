@@ -69,12 +69,12 @@ impl WebSocket {
                     break;
                 }
                 _ = cleanup_interval.tick() => {
-                    clients.retain(|h: &ClientConnection<_>| self.connection_cleanup(h));
+                    clients.retain(|h: &ClientConnection<_>| self.connection_reatined(h));
                 }
                 result = listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
-                            clients.retain(|h: &ClientConnection<_>| self.connection_cleanup(h));
+                            clients.retain(|h: &ClientConnection<_>| self.connection_reatined(h));
 
                             if clients.len() < self.max_connections as usize {
                                 let token = CancellationToken::new();
@@ -252,7 +252,13 @@ impl WebSocket {
         }
     }
 
-    fn connection_cleanup<T>(&self, client: &ClientConnection<T>) -> bool {
+    /// Checks whether a client connection should be retained in the active connections list.
+    ///
+    /// Returns `false` (remove) if the connection's task has already finished,
+    /// or if `max_lifetime` is enabled and the connection has exceeded it —
+    /// in which case the cancellation token is also triggered to initiate
+    /// a graceful shutdown. Returns `true` (keep) otherwise.
+    fn connection_reatined<T>(&self, client: &ClientConnection<T>) -> bool {
         if client.conn.is_finished() {
             return false;
         }
@@ -468,7 +474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn web_socket_connection_cleanup_task_is_finished() {
+    async fn web_socket_connection_reatined_task_is_finished() {
         let token = CancellationToken::new();
         let addr: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         
@@ -495,14 +501,14 @@ mod tests {
         };
 
         let ws = WebSocket::new(&arguments);
-        assert!(ws.connection_cleanup(&client_conn), "Should return true as task is not finished");
+        assert!(ws.connection_reatined(&client_conn), "Should return true as task is not finished");
         token.cancel();
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        assert!(!ws.connection_cleanup(&client_conn), "Should return false as task should be finished");
+        assert!(!ws.connection_reatined(&client_conn), "Should return false as task should be finished");
     }
 
     #[tokio::test]
-    async fn web_socket_connection_cleanup_max_lifetime_reached() {
+    async fn web_socket_connection_reatined_max_lifetime_reached() {
         let token = CancellationToken::new();
         let addr: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         
@@ -529,15 +535,15 @@ mod tests {
         };
 
         let ws = WebSocket::new(&arguments);
-        assert!(ws.connection_cleanup(&client_conn), "Should return true as task is not above max lifetime");
+        assert!(ws.connection_reatined(&client_conn), "Should return true as task is not above max lifetime");
         
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        assert!(!ws.connection_cleanup(&client_conn), "Should return false as task is above max lifetime");
-        assert!(token.is_cancelled(), "Token should have been cancelled by connection_cleanup");
+        assert!(!ws.connection_reatined(&client_conn), "Should return false as task is above max lifetime");
+        assert!(token.is_cancelled(), "Token should have been cancelled by connection_reatined");
     }
 
     #[tokio::test]
-    async fn web_socket_connection_cleanup_max_lifetime_reached_disabled() {
+    async fn web_socket_connection_reatined_max_lifetime_reached_disabled() {
         let token = CancellationToken::new();
         let addr: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         
@@ -564,14 +570,14 @@ mod tests {
         };
 
         let ws = WebSocket::new(&arguments);
-        assert!(ws.connection_cleanup(&client_conn), "Should return true as task timetime is not set");
+        assert!(ws.connection_reatined(&client_conn), "Should return true as task timetime is not set");
         token.cancel();
         
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        assert!(ws.connection_cleanup(&client_conn), "Should return true as task timetime is not exceeded after 1 sec");
+        assert!(ws.connection_reatined(&client_conn), "Should return true as task timetime is not exceeded after 1 sec");
         
         token.cancel();
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        assert!(!ws.connection_cleanup(&client_conn), "Should return false as task is cancelled");
+        assert!(!ws.connection_reatined(&client_conn), "Should return false as task is cancelled");
     }
 }
