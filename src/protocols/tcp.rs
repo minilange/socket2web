@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 /// Manages the lifecycle of a TCP connection including establishing
 /// the connection and bidirectional data proxying between a WebSocket
 /// client and the TCP target.
+#[derive(Debug)]
 pub struct TcpConnection {
     ip_address: String,
     port: u16,

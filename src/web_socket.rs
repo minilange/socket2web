@@ -69,12 +69,12 @@ impl WebSocket {
                     break;
                 }
                 _ = cleanup_interval.tick() => {
-                    clients.retain(|h: &ClientConnection<_>| self.connection_cleanup(h));
+                    clients.retain(|h: &ClientConnection<_>| self.connection_reatined(h));
                 }
                 result = listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
-                            clients.retain(|h: &ClientConnection<_>| self.connection_cleanup(h));
+                            clients.retain(|h: &ClientConnection<_>| self.connection_reatined(h));
 
                             if clients.len() < self.max_connections as usize {
                                 let token = CancellationToken::new();
@@ -204,7 +204,7 @@ impl WebSocket {
     /// format, including the protocol, target IP, and target port fields.
     fn get_greeting() -> Message {
         let greeting = serde_json::json!({
-            "supported protocols": {
+            "supported_protocols": {
                 TcpConnection::schema().name: TcpConnection::schema().requirements
             }
         });
@@ -252,7 +252,13 @@ impl WebSocket {
         }
     }
 
-    fn connection_cleanup<T>(&self, client: &ClientConnection<T>) -> bool {
+    /// Checks whether a client connection should be retained in the active connections list.
+    ///
+    /// Returns `false` (remove) if the connection's task has already finished,
+    /// or if `max_lifetime` is enabled and the connection has exceeded it —
+    /// in which case the cancellation token is also triggered to initiate
+    /// a graceful shutdown. Returns `true` (keep) otherwise.
+    fn connection_reatined<T>(&self, client: &ClientConnection<T>) -> bool {
         if client.conn.is_finished() {
             return false;
         }
@@ -284,5 +290,440 @@ impl WebSocket {
             "reason": reason
         });
         let _ = ws_sender.send(Message::Text(json_str.to_string())).await;
+    }
+}
+
+mod tests {
+    use super::*;
+    use std::{
+        any::{Any, TypeId},
+        net::Ipv4Addr,
+    };
+
+    #[tokio::test]
+    async fn web_socket_proxy_success() {
+        let ws_server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_port = ws_server.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move {
+            let (mut client_ws, _) =
+                tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", ws_port.port()))
+                    .await
+                    .unwrap();
+            match client_ws.next().await.unwrap() {
+                Ok(Message::Text(text)) => {
+                    return text;
+                }
+                other => {
+                    panic!("Expected Text message, got {:?}", other);
+                }
+            }
+        });
+
+        let (stream, _) = ws_server.accept().await.unwrap();
+        let ws = accept_async(stream).await.unwrap();
+        let (mut sender, _) = ws.split();
+
+        WebSocket::proxy_success(&mut sender).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), client_handle).await;
+        assert!(result.is_ok(), "Socket should have received something");
+
+        let res_string = result.unwrap().unwrap();
+
+        assert_ne!(res_string, "Failed");
+
+        let val: serde_json::Value = serde_json::from_str(&res_string).unwrap();
+        assert!(
+            val.get("status")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .starts_with("Successfully connected, starting to proxy")
+        );
+    }
+
+    #[tokio::test]
+    async fn web_socket_proxy_failed() {
+        let ws_server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_port = ws_server.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move {
+            let (mut client_ws, _) =
+                tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", ws_port.port()))
+                    .await
+                    .unwrap();
+            match client_ws.next().await.unwrap() {
+                Ok(Message::Text(text)) => {
+                    return text;
+                }
+                other => {
+                    panic!("Expected Text message, got {:?}", other);
+                }
+            }
+        });
+
+        let (stream, _) = ws_server.accept().await.unwrap();
+        let ws = accept_async(stream).await.unwrap();
+        let (mut sender, _) = ws.split();
+
+        WebSocket::proxy_failed("This is an error message", &mut sender).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), client_handle).await;
+        assert!(result.is_ok(), "Socket should have received something");
+
+        let res_string = result.unwrap().unwrap();
+
+        assert_ne!(res_string, "Failed");
+
+        let val: serde_json::Value = serde_json::from_str(&res_string).unwrap();
+        assert!(
+            val.get("status")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .starts_with("Connection failed, cancelling proxy")
+        );
+        assert!(
+            val.get("reason")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .starts_with("This is an error message")
+        );
+    }
+
+    #[test]
+    fn web_socket_read_greeting_valid_json_but_missing_fields() {
+        let json_greeting = serde_json::json!({
+            "not protocol": "whatever",
+        });
+        let res = WebSocket::read_greeting(&json_greeting.to_string());
+        assert!(res.is_err(), "Should have returned an error");
+        let err = res.unwrap_err();
+        assert_eq!(err.to_string(), "Missing or invalid protocol field");
+    }
+
+    #[test]
+    fn web_socket_read_greeting_invalid_tcp_protocol() {
+        let json_greeting = serde_json::json!({
+            "protocol": "tcp",
+        });
+        let res = WebSocket::read_greeting(&json_greeting.to_string());
+        assert!(res.is_err(), "Should have returned an error");
+        let err = res.unwrap_err();
+        assert_eq!(err.to_string(), "Missing or invalid target_ip");
+    }
+
+    #[test]
+    fn web_socket_read_greeting_invalid_tcp_protocol_with_ip() {
+        let json_greeting = serde_json::json!({
+            "protocol": "tcp",
+            "target_ip": "some_ip"
+        });
+        let res = WebSocket::read_greeting(&json_greeting.to_string());
+        assert!(res.is_err(), "Should have returned an error");
+        let err = res.unwrap_err();
+        assert_eq!(err.to_string(), "Missing or invalid target_port");
+    }
+
+    #[test]
+    fn web_socket_read_greeting_invalid_tcp_protocol_with_invalid_port() {
+        let json_greeting = serde_json::json!({
+            "protocol": "tcp",
+            "target_ip": "some_ip",
+            "target_port": "not a num"
+        });
+        let res = WebSocket::read_greeting(&json_greeting.to_string());
+        assert!(res.is_err(), "Should have returned an error");
+        let err = res.unwrap_err();
+        assert_eq!(err.to_string(), "Missing or invalid target_port");
+    }
+
+    #[test]
+    fn web_socket_read_greeting_valid_tcp_protocol() {
+        let json_greeting = serde_json::json!({
+            "protocol": "tcp",
+            "target_ip": "some_ip",
+            "target_port": 123
+        });
+        let res = WebSocket::read_greeting(&json_greeting.to_string());
+        assert!(res.is_ok(), "Should have returned ok");
+        assert!(matches!(res.unwrap(), Protocol::Tcp(_)));
+    }
+
+    #[test]
+    fn web_socket_read_greeting_invalid_json() {
+        let json_greeting = "this is not json";
+        let res = WebSocket::read_greeting(json_greeting);
+        assert!(res.is_err(), "Should have returned an error");
+    }
+
+    #[tokio::test]
+    async fn web_socket_get_greeting_contains_tcp() {
+        let greeting_str = match WebSocket::get_greeting() {
+            Message::Text(msg) => msg,
+            _ => panic!("Should have received a Message::Text()"),
+        };
+
+        let greeting_obj: serde_json::Value = serde_json::from_str(&greeting_str).unwrap();
+
+        let supported_protocol = greeting_obj.get("supported_protocols").unwrap();
+        assert!(supported_protocol.get("tcp").is_some());
+    }
+
+    #[tokio::test]
+    async fn web_socket_connection_reatined_task_is_finished() {
+        let token = CancellationToken::new();
+        let addr: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        let client_token = token.clone();
+        let dummy_token = token.clone();
+        let dummy_handle = tokio::spawn(async move {
+            dummy_token.cancelled().await;
+        });
+
+        let client_conn = ClientConnection {
+            addr: addr,
+            conn: dummy_handle,
+            cancel_token: client_token,
+            start: time::Instant::now(),
+        };
+
+        let arguments = arguments::WebSocketArguments {
+            ip: "127.0.0.1".into(),
+            port: 1234,
+            log_level: "info".into(),
+            max_lifetime: 3600,
+            max_connections: 1000,
+            timeout: 10,
+        };
+
+        let ws = WebSocket::new(&arguments);
+        assert!(
+            ws.connection_reatined(&client_conn),
+            "Should return true as task is not finished"
+        );
+        token.cancel();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(
+            !ws.connection_reatined(&client_conn),
+            "Should return false as task should be finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_socket_connection_reatined_max_lifetime_reached() {
+        let token = CancellationToken::new();
+        let addr: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        let client_token = token.clone();
+        let dummy_token = token.clone();
+        let dummy_handle = tokio::spawn(async move {
+            dummy_token.cancelled().await;
+        });
+
+        let client_conn = ClientConnection {
+            addr: addr,
+            conn: dummy_handle,
+            cancel_token: client_token,
+            start: time::Instant::now(),
+        };
+
+        let arguments = arguments::WebSocketArguments {
+            ip: "127.0.0.1".into(),
+            port: 1234,
+            log_level: "info".into(),
+            max_lifetime: 1,
+            max_connections: 1000,
+            timeout: 10,
+        };
+
+        let ws = WebSocket::new(&arguments);
+        assert!(
+            ws.connection_reatined(&client_conn),
+            "Should return true as task is not above max lifetime"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(
+            !ws.connection_reatined(&client_conn),
+            "Should return false as task is above max lifetime"
+        );
+        assert!(
+            token.is_cancelled(),
+            "Token should have been cancelled by connection_reatined"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_socket_connection_reatined_max_lifetime_reached_disabled() {
+        let token = CancellationToken::new();
+        let addr: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        let client_token = token.clone();
+        let dummy_token = token.clone();
+        let dummy_handle = tokio::spawn(async move {
+            dummy_token.cancelled().await;
+        });
+
+        let client_conn = ClientConnection {
+            addr: addr,
+            conn: dummy_handle,
+            cancel_token: client_token,
+            start: time::Instant::now(),
+        };
+
+        let arguments = arguments::WebSocketArguments {
+            ip: "127.0.0.1".into(),
+            port: 1234,
+            log_level: "info".into(),
+            max_lifetime: 0,
+            max_connections: 1000,
+            timeout: 10,
+        };
+
+        let ws = WebSocket::new(&arguments);
+        assert!(
+            ws.connection_reatined(&client_conn),
+            "Should return true as task timetime is not set"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(
+            ws.connection_reatined(&client_conn),
+            "Should return true as task timetime is not exceeded after 1 sec"
+        );
+
+        token.cancel();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(
+            !ws.connection_reatined(&client_conn),
+            "Should return false as task is cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_handle_handshake_receive_greeting() {
+        let ws_server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_port = ws_server.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move {
+            let (mut client_ws, _) =
+                tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", ws_port.port()))
+                    .await
+                    .unwrap();
+            match client_ws.next().await.unwrap() {
+                Ok(Message::Text(text)) => {
+                    return text;
+                }
+                other => {
+                    panic!("Expected Text message, got {:?}", other);
+                }
+            }
+        });
+
+        let (stream, _) = ws_server.accept().await.unwrap();
+        let ws = accept_async(stream).await.unwrap();
+        let (mut ws_sender, mut ws_receiver) = ws.split();
+
+        let res = WebSocket::handle_handshake(&mut ws_sender, &mut ws_receiver, &1).await;
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        assert!(res.is_err(), "Should return an error as will time out");
+
+        let client_res = client_handle.await;
+
+        let greeting_str = client_res.unwrap();
+        let greeting: serde_json::Value = serde_json::from_str(&greeting_str).unwrap();
+
+        assert!(
+            greeting.get("supported_protocols").is_some(),
+            "Should have received supported protocols in greeting"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_handle_handshake_get_tcp_connection() {
+        let ws_server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_port = ws_server.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = ws_server.accept().await.unwrap();
+            let ws = accept_async(stream).await.unwrap();
+            let (mut ws_sender, mut ws_receiver) = ws.split();
+
+            return WebSocket::handle_handshake(&mut ws_sender, &mut ws_receiver, &5).await;
+        });
+
+        let (client_ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", ws_port.port()))
+                .await
+                .unwrap();
+        let (mut write, mut read) = client_ws.split();
+
+        match read.next().await.unwrap() {
+            Ok(Message::Text(_)) => {}
+            other => {
+                panic!("Expected Text message, got {:?}", other);
+            }
+        }
+
+        let json_msg = serde_json::json!({
+            "protocol": "tcp",
+            "target_ip": "127.0.0.1",
+            "target_port": 12345
+        });
+        let _ = write.send(Message::Text(json_msg.to_string())).await;
+
+        let res = server_handle.await.unwrap();
+
+        assert!(res.is_ok(), "Should return a tcp protocol");
+        assert_eq!(res.unwrap().type_id(), TypeId::of::<Protocol>())
+    }
+
+    #[tokio::test]
+    async fn websocket_handle_handshake_send_binary_greet() {
+        let ws_server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_port = ws_server.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = ws_server.accept().await.unwrap();
+            let ws = accept_async(stream).await.unwrap();
+            let (mut ws_sender, mut ws_receiver) = ws.split();
+
+            return WebSocket::handle_handshake(&mut ws_sender, &mut ws_receiver, &5).await;
+        });
+
+        let (client_ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", ws_port.port()))
+                .await
+                .unwrap();
+        let (mut write, mut read) = client_ws.split();
+
+        match read.next().await.unwrap() {
+            Ok(Message::Text(_)) => {}
+            other => {
+                panic!("Expected Text message, got {:?}", other);
+            }
+        }
+
+        let json_msg = serde_json::json!({
+            "protocol": "tcp",
+            "target_ip": "127.0.0.1",
+            "target_port": 12345
+        });
+        let _ = write
+            .send(Message::Binary(json_msg.to_string().into_bytes()))
+            .await;
+
+        let res = server_handle.await.unwrap();
+
+        assert!(res.is_err(), "Should return an error");
+        assert_eq!(
+            res.unwrap_err().to_string(),
+            "Received unexpected, closing connection!"
+        );
     }
 }
