@@ -236,9 +236,9 @@ impl WebSocket {
                     .ok_or("Missing or invalid target_ip")?
                     .to_string();
 
-                // if target_ip.starts_with("127.") || target_ip == "localhost" {
-                //     return Err("Proxying to loopback is not allowed".into())
-                // }
+                if target_ip.starts_with("127.") || target_ip == "localhost" {
+                    return Err("Proxying to loopback is not allowed".into())
+                }
 
                 let target_port = handshake
                     .get("target_port")
