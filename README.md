@@ -24,7 +24,7 @@ Upon connecting to the WebSocket server, the client receives a greeting message 
 **Example greeting (sent by server):**
 ```json
 {
-  "supported protocols": {
+  "supported_protocols": {
     "tcp": {
       "target_ip": "IP Address",
       "target_port": "Port for IP Address"
