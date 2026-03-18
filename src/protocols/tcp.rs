@@ -1,6 +1,10 @@
-use crate::protocols::{ProtocolSchema, ProxyTarget, Schema, WebSocketReceiver, WebSocketSender};
+use crate::{
+    metrics::Metrics,
+    protocols::{ProtocolSchema, ProxyTarget, Schema, WebSocketReceiver, WebSocketSender},
+};
 use futures_util::{SinkExt, StreamExt};
-use std::io;
+use opentelemetry::KeyValue;
+use std::{io, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -18,8 +22,8 @@ use tokio_util::sync::CancellationToken;
 /// client and the TCP target.
 #[derive(Debug)]
 pub struct TcpConnection {
-    ip_address: String,
-    port: u16,
+    pub ip_address: String,
+    pub port: u16,
     stream: Option<TcpStream>,
 }
 
@@ -44,6 +48,7 @@ impl TcpConnection {
         mut tcp_reader: OwnedReadHalf,
         mut ws_sender: WebSocketSender,
         token: tokio_util::sync::CancellationToken,
+        metrics: Arc<Metrics>,
     ) {
         let mut buffer = vec![0u8; 65536];
         loop {
@@ -67,6 +72,7 @@ impl TcpConnection {
                                 tracing::error!("Encountered an error while transmitting to web: {}", tx_err);
                                 break;
                             }
+                            TcpConnection::add_bytes_received(&metrics, rx_n);
                         }
                         Err(err) => {
                             if err.kind() != io::ErrorKind::WouldBlock {
@@ -98,6 +104,7 @@ impl TcpConnection {
         mut ws_receiver: WebSocketReceiver,
         mut tcp_writer: OwnedWriteHalf,
         token: tokio_util::sync::CancellationToken,
+        metrics: Arc<Metrics>
     ) {
         loop {
             tokio::select! {
@@ -113,12 +120,14 @@ impl TcpConnection {
                                 tracing::error!("Encountered an error while sending 'Text' to tcp: {}", err);
                                 break;
                             }
+                            TcpConnection::add_bytes_sent(&metrics, text.len(), "text".into());
                         }
                         Some(Ok(Message::Binary(bin))) => {
                             if let Err(err) = tcp_writer.write_all(&bin).await {
                                 tracing::error!("Encountered an error while sending 'Binary' to tcp: {}", err);
                                 break;
                             }
+                            TcpConnection::add_bytes_sent(&metrics, bin.len(), "binary".into());
                         }
                         Some(Ok(Message::Pong(_))) |
                         Some(Ok(Message::Ping(_))) => { }
@@ -127,6 +136,7 @@ impl TcpConnection {
                                 tracing::error!("Encountered an error while sending 'Frame' to tcp: {}", err);
                                 break;
                             }
+                            // TcpConnection::add_bytes_received(&metrics, frame.into_data().len(), "text".into());
                         }
                         Some(Ok(Message::Close(_))) => {
                             tracing::debug!("WebSocket closed by client");
@@ -153,6 +163,26 @@ impl TcpConnection {
         }
         let _ = tcp_writer.shutdown().await;
         tracing::trace!("Web->TCP proxy ended");
+    }
+
+    pub fn add_bytes_received(metrics: &Arc<Metrics>, num_bytes: usize) {
+        metrics.proxied_bytes_counter.add(
+            num_bytes as u64,
+            &[
+                KeyValue::new("type", "binary"),
+                KeyValue::new("direction", "to_client"),
+            ],
+        );
+    }
+
+    pub fn add_bytes_sent(metrics: &Arc<Metrics>, num_bytes: usize, byte_type: String) {
+        metrics.proxied_bytes_counter.add(
+            num_bytes as u64,
+            &[
+                KeyValue::new("type", byte_type),
+                KeyValue::new("direction", "from_client")
+            ],
+        );
     }
 }
 
@@ -182,6 +212,7 @@ impl ProxyTarget for TcpConnection {
         ws_sender: WebSocketSender,
         ws_receiver: WebSocketReceiver,
         cancel_token: CancellationToken,
+        metrics: Arc<Metrics>,
     ) {
         let (tcp_reader, tcp_writer) = match self.stream.take() {
             Some(stream) => stream.into_split(),
@@ -198,8 +229,11 @@ impl ProxyTarget for TcpConnection {
             tcp_reader,
             ws_sender,
             server_token,
+            metrics.clone(),
         ));
-        let _ = TcpConnection::proxy_web_to_tcp(ws_receiver, tcp_writer, target_token).await;
+        
+        let _ =
+            TcpConnection::proxy_web_to_tcp(ws_receiver, tcp_writer, target_token, metrics.clone()).await;
         let _ = tcp_to_web.await;
     }
 }
@@ -224,6 +258,7 @@ impl ProtocolSchema for TcpConnection {
 mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
+    use opentelemetry::global;
     use tokio_tungstenite::tungstenite::Message;
 
     /// Creates a connected WebSocket pair (client-side stream, server-side sender+receiver)
@@ -280,6 +315,11 @@ mod tests {
             tcp_reader,
             tcp_writer,
         )
+    }
+
+    fn create_metrics() -> Arc<Metrics> {
+        let meter = global::meter("test_mock");
+        Arc::new(Metrics::new(&meter))
     }
 
     #[test]
@@ -353,7 +393,7 @@ mod tests {
 
             let mut conn = TcpConnection::new("127.0.0.1".into(), target_addr.port());
             conn.connect().await.unwrap();
-            conn.attach_handles(ws_sender, ws_receiver, server_token)
+            conn.attach_handles(ws_sender, ws_receiver, server_token, create_metrics())
                 .await;
         });
 
@@ -405,7 +445,7 @@ mod tests {
             let (ws_sender, ws_receiver) = futures_util::StreamExt::split(ws_stream);
 
             let mut conn = TcpConnection::new("127.0.0.1".into(), target_addr.port());
-            conn.attach_handles(ws_sender, ws_receiver, server_token)
+            conn.attach_handles(ws_sender, ws_receiver, server_token, create_metrics())
                 .await;
         });
 
@@ -448,7 +488,8 @@ mod tests {
         let proxy_token = token.clone();
 
         let proxy_handle = tokio::spawn(async move {
-            TcpConnection::proxy_web_to_tcp(ws_receiver, tcp_writer, proxy_token).await;
+            TcpConnection::proxy_web_to_tcp(ws_receiver, tcp_writer, proxy_token, create_metrics())
+                .await;
         });
 
         client_ws
@@ -457,10 +498,13 @@ mod tests {
             .unwrap();
 
         let mut buf = vec![0u8; 1024];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(1), target_stream.read(&mut buf))
-            .await
-            .expect("Timed out waiting for data on target")
-            .expect("Failed to read from target");
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            target_stream.read(&mut buf),
+        )
+        .await
+        .expect("Timed out waiting for data on target")
+        .expect("Failed to read from target");
 
         assert_eq!(&buf[..n], b"hello tcp");
 
@@ -477,7 +521,8 @@ mod tests {
         let proxy_token = token.clone();
 
         let proxy_handle = tokio::spawn(async move {
-            TcpConnection::proxy_web_to_tcp(ws_receiver, tcp_writer, proxy_token).await;
+            TcpConnection::proxy_web_to_tcp(ws_receiver, tcp_writer, proxy_token, create_metrics())
+                .await;
         });
 
         client_ws
@@ -486,10 +531,13 @@ mod tests {
             .unwrap();
 
         let mut buf = vec![0u8; 1024];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(2), target_stream.read(&mut buf))
-            .await
-            .expect("Timed out waiting for data on target")
-            .expect("Failed to read from target");
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            target_stream.read(&mut buf),
+        )
+        .await
+        .expect("Timed out waiting for data on target")
+        .expect("Failed to read from target");
 
         assert_eq!(&buf[..n], b"hello as text");
 
@@ -506,7 +554,8 @@ mod tests {
         let proxy_token = token.clone();
 
         let proxy_handle = tokio::spawn(async move {
-            TcpConnection::proxy_web_to_tcp(ws_receiver, tcp_writer, proxy_token).await;
+            TcpConnection::proxy_web_to_tcp(ws_receiver, tcp_writer, proxy_token, create_metrics())
+                .await;
         });
 
         client_ws.close(None).await.unwrap();
@@ -530,7 +579,8 @@ mod tests {
         let proxy_token = token.clone();
 
         let proxy_handle = tokio::spawn(async move {
-            TcpConnection::proxy_web_to_tcp(ws_receiver, tcp_writer, proxy_token).await;
+            TcpConnection::proxy_web_to_tcp(ws_receiver, tcp_writer, proxy_token, create_metrics())
+                .await;
         });
 
         token.cancel();
@@ -551,7 +601,8 @@ mod tests {
         let proxy_token = token.clone();
 
         let proxy_handle = tokio::spawn(async move {
-            TcpConnection::proxy_tcp_to_web(tcp_reader, ws_sender, proxy_token).await;
+            TcpConnection::proxy_tcp_to_web(tcp_reader, ws_sender, proxy_token, create_metrics())
+                .await;
         });
 
         target_stream.write_all(b"hello websocket").await.unwrap();
@@ -580,7 +631,8 @@ mod tests {
         let proxy_token = token.clone();
 
         let proxy_handle = tokio::spawn(async move {
-            TcpConnection::proxy_tcp_to_web(tcp_reader, ws_sender, proxy_token).await;
+            TcpConnection::proxy_tcp_to_web(tcp_reader, ws_sender, proxy_token, create_metrics())
+                .await;
         });
 
         drop(target_stream);
@@ -604,7 +656,8 @@ mod tests {
         let proxy_token = token.clone();
 
         let proxy_handle = tokio::spawn(async move {
-            TcpConnection::proxy_tcp_to_web(tcp_reader, ws_sender, proxy_token).await;
+            TcpConnection::proxy_tcp_to_web(tcp_reader, ws_sender, proxy_token, create_metrics())
+                .await;
         });
 
         // Cancel externally

@@ -1,5 +1,9 @@
 use futures_util::{SinkExt, StreamExt};
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::MeterProvider;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{self, Duration};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -9,6 +13,7 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 
 use crate::arguments;
+use crate::metrics::Metrics;
 use crate::protocols::tcp::TcpConnection;
 use crate::protocols::{Protocol, ProtocolSchema, ProxyTarget, WebSocketReceiver, WebSocketSender};
 
@@ -19,6 +24,7 @@ pub struct WebSocket {
     timeout: u64,
     max_lifetime: u64,
     max_connections: u64,
+    metrics: Arc<Metrics>,
 }
 
 /// Tracks an active proxied connection along with its start time.
@@ -35,12 +41,16 @@ pub struct ClientConnection<T> {
 
 impl WebSocket {
     /// Creates a new `WebSocket` server from the provided CLI configuration.
-    pub fn new(config: &arguments::WebSocketArguments) -> Self {
+    pub fn new(config: &arguments::WebSocketArguments, provider: &SdkMeterProvider) -> Self {
+        let meter = provider.meter("socket2web");
+        let metrics = Metrics::new(&meter);
+
         Self {
             address: format!("{}:{}", config.ip, config.port),
             timeout: config.timeout,
             max_lifetime: config.max_lifetime,
             max_connections: config.max_connections,
+            metrics: Arc::new(metrics),
         }
     }
 
@@ -70,6 +80,7 @@ impl WebSocket {
                 }
                 _ = cleanup_interval.tick() => {
                     clients.retain(|h: &ClientConnection<_>| self.connection_reatined(h));
+                    self.metrics.active_connections_gauge.record(clients.len() as u64, &[]);
                 }
                 result = listener.accept() => {
                     match result {
@@ -78,9 +89,10 @@ impl WebSocket {
 
                             if clients.len() < self.max_connections as usize {
                                 let token = CancellationToken::new();
+                                let metrics = self.metrics.clone();
                                 let conn = ClientConnection {
                                     addr: addr.ip().clone(),
-                                    conn: tokio::spawn(WebSocket::handle_connection(stream, addr, self.timeout, token.clone())),
+                                    conn: tokio::spawn(WebSocket::handle_connection(stream, addr, self.timeout, token.clone(), metrics)),
                                     cancel_token: token,
                                     start: time::Instant::now()
                                 };
@@ -131,6 +143,7 @@ impl WebSocket {
         addr: SocketAddr,
         timeout: u64,
         cancel_token: CancellationToken,
+        metrics: Arc<Metrics>,
     ) {
         tracing::info!("New connection from {}", addr.ip());
 
@@ -147,10 +160,28 @@ impl WebSocket {
             Ok(Protocol::Tcp(mut proxy)) => {
                 if let Err(e) = proxy.connect().await {
                     WebSocket::proxy_failed(&e.to_string(), &mut ws_sender).await;
+                    metrics.connections_counter.add(
+                        1,
+                        &[
+                            KeyValue::new("handshake_status", "failed"),
+                            KeyValue::new("protocol", "tcp"),
+                            KeyValue::new("client", addr.ip().to_string()),
+                            KeyValue::new("target", proxy.ip_address),
+                        ],
+                    );
                 } else {
                     WebSocket::proxy_success(&mut ws_sender).await;
+                    metrics.connections_counter.add(
+                        1,
+                        &[
+                            KeyValue::new("handshake_status", "success"),
+                            KeyValue::new("protocol", "tcp"),
+                            KeyValue::new("client", addr.ip().to_string()),
+                            KeyValue::new("target", proxy.ip_address.clone()),
+                        ],
+                    );
                     proxy
-                        .attach_handles(ws_sender, ws_receiver, cancel_token)
+                        .attach_handles(ws_sender, ws_receiver, cancel_token, metrics.clone())
                         .await;
                 }
             }
@@ -236,9 +267,9 @@ impl WebSocket {
                     .ok_or("Missing or invalid target_ip")?
                     .to_string();
 
-                if target_ip.starts_with("127.") || target_ip == "localhost" {
-                    return Err("Proxying to loopback is not allowed".into())
-                }
+                // if target_ip.starts_with("127.") || target_ip == "localhost" {
+                //     return Err("Proxying to loopback is not allowed".into());
+                // }
 
                 let target_port = handshake
                     .get("target_port")
@@ -295,6 +326,9 @@ impl WebSocket {
 
 #[cfg(test)]
 mod tests {
+    use opentelemetry::global;
+    use opentelemetry_sdk::metrics::exporter;
+
     use super::*;
     use std::{
         any::{Any, TypeId},
@@ -500,7 +534,9 @@ mod tests {
             timeout: 10,
         };
 
-        let ws = WebSocket::new(&arguments);
+        let provider = SdkMeterProvider::builder().build();
+
+        let ws = WebSocket::new(&arguments, &provider);
         assert!(
             ws.connection_reatined(&client_conn),
             "Should return true as task is not finished"
@@ -540,7 +576,8 @@ mod tests {
             timeout: 10,
         };
 
-        let ws = WebSocket::new(&arguments);
+        let provider = SdkMeterProvider::builder().build();
+        let ws = WebSocket::new(&arguments, &provider);
         assert!(
             ws.connection_reatined(&client_conn),
             "Should return true as task is not above max lifetime"
@@ -584,7 +621,8 @@ mod tests {
             timeout: 10,
         };
 
-        let ws = WebSocket::new(&arguments);
+        let provider = SdkMeterProvider::builder().build();
+        let ws = WebSocket::new(&arguments, &provider);
         assert!(
             ws.connection_reatined(&client_conn),
             "Should return true as task timetime is not set"

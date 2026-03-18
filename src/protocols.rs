@@ -1,9 +1,8 @@
 pub mod tcp;
-
+use std::sync::Arc;
 use futures_util::stream::{SplitSink, SplitStream};
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
-
-use crate::protocols::tcp::TcpConnection;
+use crate::{metrics::Metrics, protocols::tcp::TcpConnection};
 
 /// Enumerates the supported proxy target protocols.
 #[derive(Debug)]
@@ -35,7 +34,7 @@ pub trait ProxyTarget: Send {
     ///
     /// This method should run until the connection is closed from either side
     /// or the cancellation token is triggered.
-    async fn attach_handles(&mut self, ws_sender: WebSocketSender, ws_receiver: WebSocketReceiver, cancel_token: CancellationToken);
+    async fn attach_handles(&mut self, ws_sender: WebSocketSender, ws_receiver: WebSocketReceiver, cancel_token: CancellationToken, metrics: Arc<Metrics>);
 }
 
 /// Describes the handshake schema for a supported protocol.
