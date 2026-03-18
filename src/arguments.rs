@@ -29,5 +29,9 @@ pub struct WebSocketArguments {
     /// the maxmimum lifetime of a single connection in seconds (default: 3600)
     /// if max_lifetime is set to 0, it's ignored
     #[argh(option, default = "3600")]
-    pub max_lifetime: u64
+    pub max_lifetime: u64,
+
+    /// the endpoint to your otel collector using otlp
+    #[argh(option, default= "String::from(\"\")")]
+    pub otlp_endpoint: String
 }

@@ -1,9 +1,10 @@
 mod arguments;
+mod metrics;
 mod protocols;
 mod web_socket;
-mod metrics;
 
 use crate::web_socket::WebSocket;
+use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use tracing_subscriber::EnvFilter;
 
@@ -19,9 +20,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         EnvFilter::new("info")
     });
     tracing_subscriber::fmt().with_env_filter(filter).init();
-    
-    let exporter = opentelemetry_stdout::MetricExporter::default();
-    let provider = SdkMeterProvider::builder().with_periodic_exporter(exporter).build();
+
+    let provider = if !config.otlp_endpoint.is_empty() {
+        let exporter = opentelemetry_otlp::MetricExporter::builder()
+            .with_http()
+            .with_endpoint(&config.otlp_endpoint)
+            .with_protocol(opentelemetry_otlp::Protocol::HttpJson)
+            .build()
+            .expect("Failed to build OTLP exporter");
+        SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter)
+            .build()
+    } else {
+        let exporter = opentelemetry_stdout::MetricExporter::default();
+        SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter)
+            .build()
+    };
 
     let ws = WebSocket::new(&config, &provider);
 
